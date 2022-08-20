@@ -53,13 +53,14 @@ module emu
 	output        VGA_F1,
 	output [1:0]  VGA_SL,
 	output        VGA_SCALER, // Force VGA scaler
+	output        VGA_DISABLE,
 
 	input  [11:0] HDMI_WIDTH,
 	input  [11:0] HDMI_HEIGHT,
 	output        HDMI_FREEZE,
 
 `ifdef MISTER_FB
-	// Use framebuffer in DDRAM (USE_FB=1 in qsf)
+	// Use framebuffer in DDRAM
 	// FB_FORMAT:
 	//    [2:0] : 011=8bpp(palette) 100=16bpp 101=24bpp 110=32bpp
 	//    [3]   : 0=16bits 565 1=16bits 1555
@@ -187,6 +188,7 @@ assign LED_POWER = 0;
 assign BUTTONS   = 0;
 assign HDMI_FREEZE = 0;
 assign VGA_SCALER= 0;
+assign VGA_DISABLE = 0;
 
 assign AUDIO_MIX = status[8:7];
 
@@ -194,13 +196,15 @@ assign AUDIO_MIX = status[8:7];
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX XXXXXXX
+// XXXXXXXXXXX XXXXXXXXXXXXXXXXXXXX XXXXXXXXXX
 
 `include "build_id.v" 
 localparam CONF_STR = {
 	"GAMEBOY;SS3E000000:40000;",
 	"FS1,GBCGB BIN,Load ROM;",
 	"OEF,System,Auto,Gameboy,Gameboy Color,MegaDuck;",
+	"D7o79,Mapper,Auto,WisdomTree,Mani161,MBC1,MBC3;",
+	"-;",
 	"ONO,Super Game Boy,Off,Palette,On;",
 	"d5FC2,SGB,Load SGB border;",
 	"-;",
@@ -237,7 +241,10 @@ localparam CONF_STR = {
 
 	"P2,Misc.;",
 	"P2-;",
-	"P2OB,Boot,Normal,Fast;",
+	"P2FC4,BIN,Load GBC Boot;",
+	"P2FC5,BIN,Load DMG Boot;",
+	"P2FC6,BIN,Load SGB Boot;",
+	"P2-;",
 	"P2O6,Link Port,Disabled,Enabled;",
 	"P2o6,Rumble,On,Off;",
 	"P2-;",
@@ -319,6 +326,10 @@ wire [15:0] joy0_rumble;
 
 wire [32:0] RTC_time;
 
+wire        sys_auto     = (status[15:14] == 0);
+wire        sys_gbc      = (status[15:14] == 2);
+wire        sys_megaduck = (status[15:14] == 3);
+
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
 	.clk_sys(clk_sys),
@@ -346,7 +357,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 	.buttons(buttons),
 	.status(status),
-	.status_menumask({using_real_bios,sgb_border_en,isGBC,cart_ready,sav_supported,|tint,gg_available}),
+	.status_menumask({sys_megaduck,using_real_cgb_bios,sgb_border_en,isGBC,cart_ready,sav_supported,|tint,gg_available}),
 	.status_in({status[63:34],ss_slot,status[31:0]}),
 	.status_set(statusUpdate),
 	.direct_video(direct_video),
@@ -383,10 +394,14 @@ wire [7:0] cart_di, cart_do;
 wire nCS; // WRAM or Cart RAM CS
 
 wire cart_download = ioctl_download && (filetype[5:0] == 6'h01 || filetype == 8'h80);
-wire md_download = cart_download && filetype[7:6] == 2'd2;
+wire md_download = ioctl_download && (filetype == 8'h81);
 wire palette_download = ioctl_download && (filetype == 3 /*|| !filetype*/);
-wire bios_download = ioctl_download && (filetype == 8'h40);
 wire sgb_border_download = ioctl_download && (filetype == 2);
+wire cgb_boot_download = ioctl_download && (filetype == 4);
+wire dmg_boot_download = ioctl_download && (filetype == 5);
+wire sgb_boot_download = ioctl_download && (filetype == 6);
+wire boot_download = cgb_boot_download | dmg_boot_download | sgb_boot_download;
+
 
 wire  [1:0] sdram_ds = cart_download ? 2'b11 : {mbc_addr[0], ~mbc_addr[0]};
 wire [15:0] sdram_do;
@@ -438,6 +453,7 @@ wire [31:0] RTC_timestampOut;
 wire [47:0] RTC_savedtimeOut;
 wire RTC_inuse;
 wire rumbling;
+wire [2:0] mapper_sel = status[41:39];
 
 assign joy0_rumble = {8'd0, ((rumbling & ~status[38]) ? 8'd128 : 8'd0)};
 
@@ -449,6 +465,7 @@ cart_top cart (
 	.ce_cpu2x    ( ce_cpu2x   ),
 	.speed       ( speed      ),
 	.megaduck    ( megaduck   ),
+	.mapper_sel  ( mapper_sel ),
 
 	.cart_addr   ( cart_addr  ),
 	.cart_a15    ( cart_a15   ),
@@ -516,11 +533,11 @@ cart_top cart (
 );
 
 reg [127:0] palette = 128'h828214517356305A5F1A3B4900000000;
-reg using_real_bios = 0;
+reg using_real_cgb_bios = 0;
 
 always @(posedge clk_sys) begin
-	if (bios_download)
-		using_real_bios <= 1;
+	if (cgb_boot_download)
+		using_real_cgb_bios <= 1;
 	if (palette_download & ioctl_wr) begin
 			palette[127:0] <= {palette[111:0], ioctl_dout[7:0], ioctl_dout[15:8]};
 	end
@@ -537,19 +554,22 @@ wire DMA_on;
 
 assign AUDIO_S = 0;
 
-wire reset = (RESET | status[0] | buttons[1] | cart_download | bk_loading);
+wire reset = (RESET | status[0] | buttons[1] | cart_download | boot_download | bk_loading);
 wire speed;
 reg megaduck = 0;
 
 reg isGBC = 0;
 always @(posedge clk_sys) if(reset) begin
 	if (cart_download)
-		megaduck <= (status[15:14] == 3);
+		megaduck <= sys_megaduck;
 	if (md_download)
-		megaduck <= (status[15:14] == 0) || (status[15:14] == 3);
+		megaduck <= sys_auto || sys_megaduck;
 
-	if(status[15:14]) isGBC <= (status[15:14] == 2);
-	else if(cart_download) isGBC <= (status[15:14] == 0) && !filetype[7:6];
+	if(~sys_auto) isGBC <= sys_gbc;
+	else if(cart_download) begin
+		if (!filetype[5:0]) isGBC <= isGBC_game;
+		else isGBC <= !filetype[7:6];
+	end
 end
 
 wire [15:0] GB_AUDIO_L;
@@ -563,8 +583,6 @@ gb gb (
 	.ce          ( ce_cpu     ),   // the whole gameboy runs on 4mhnz
 	.ce_2x       ( ce_cpu2x   ),   // ~8MHz in dualspeed mode (GBC)
 	
-	.fast_boot   ( status[11]  ),
-
 	.isGBC       ( isGBC      ),
 	.isGBC_game  ( isGBC_game ),
 	.isSGB       ( |sgb_en & ~isGBC ),
@@ -584,9 +602,14 @@ gb gb (
 
 	.nCS         ( nCS        ),
 
-	//gbc bios interface
-	.gbc_bios_addr   ( bios_addr  ),
-	.gbc_bios_do     ( bios_do_mod  ),
+	.boot_gba_en    ( status[37] && using_real_cgb_bios ),
+
+	.cgb_boot_download ( cgb_boot_download ),
+	.dmg_boot_download ( dmg_boot_download ),
+	.sgb_boot_download ( sgb_boot_download ),
+	.ioctl_wr       ( ioctl_wr       ),
+	.ioctl_addr     ( ioctl_addr     ),
+	.ioctl_dout     ( ioctl_dout     ),
 
 	// audio
 	.audio_l 	 ( GB_AUDIO_L ),
@@ -920,42 +943,6 @@ savestate_ui savestate_ui
 	.selected_slot  (ss_slot       )
 );
 defparam savestate_ui.INFO_TIMEOUT_BITS = 27;
-
-///////////////////////////// GBC BIOS /////////////////////////////////
-
-wire [7:0] bios_do;
-wire [11:0] bios_addr;
-wire [7:0] bios_do_gba;
-wire [7:0] bios_do_mod;
-
-always_comb begin
-	case (bios_addr)
-		12'h0F2: bios_do_gba = 8'h00;
-		12'h0F3: bios_do_gba = 8'h00;
-		12'h0F5: bios_do_gba = 8'hCD;
-		12'h0F6: bios_do_gba = 8'hD0;
-		12'h0F7: bios_do_gba = 8'h05;
-		12'h0F8: bios_do_gba = 8'hAF;
-		12'h0F9: bios_do_gba = 8'hE0;
-		12'h0FA: bios_do_gba = 8'h70;
-		12'h0FB: bios_do_gba = 8'h04;
-		12'h409: bios_do_gba = 8'h80;
-		12'h40A: bios_do_gba = 8'hFF;
-		default: bios_do_gba = bios_do;
-	endcase
-	bios_do_mod = (status[37] && using_real_bios) ? bios_do_gba : bios_do;
-end
-
-dpram_dif #(12,8,11,16,"BootROMs/cgb_boot.mif") boot_rom_gbc (
-	.clock (clk_sys),
-	
-	.address_a (bios_addr),
-	.q_a (bios_do),
-	
-	.address_b (ioctl_addr[11:1]),
-	.wren_b (ioctl_wr && bios_download),
-	.data_b (ioctl_dout)
-);
 
 ///////////////////////////// CHEATS //////////////////////////////////
 // Code loading for WIDE IO (16 bit)
